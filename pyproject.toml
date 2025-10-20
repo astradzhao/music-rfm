@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musicrfm"
+version = "0.1.0"
+description = "Representation Finetuning for Music Generation Control"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "Music RFM Team"}
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "scikit-learn",
+    "tqdm",
+    "soundfile",
+    "transformers",
+    "pandas",
+    "xrfm",
+    "datasets",
+    "torchaudio",
+    "torchcodec",
+]
+
+[tool.setuptools]
+packages = ["musicrfm"]
+

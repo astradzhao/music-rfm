@@ -1,0 +1,11 @@
+torch
+numpy
+scikit-learn
+tqdm
+soundfile
+transformers
+pandas
+xrfm
+datasets
+torchaudio
+torchcodec
