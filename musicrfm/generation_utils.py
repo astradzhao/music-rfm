@@ -16,70 +16,6 @@ def generate_on_text(model, tokenizer, input_text, **kwargs):
     generated_text = tokenizer.decode(outputs[0])
     return generated_text
 
-# def hook_model(model, directions, layers_to_control, control_coef, inject_chance=1, component_idxs=[0], time_control_fn=None, layer_weights=None):
-#     hooks = {}
-    
-#     # Create a time step counter for each layer
-#     time_step_counters = {layer_idx: 0 for layer_idx in layers_to_control}
-    
-#     # Create a mapping from layer_idx to its weight
-#     layer_weight_map = {}
-#     if layer_weights is not None:
-#         for i, layer_idx in enumerate(layers_to_control):
-#             layer_weight_map[layer_idx] = layer_weights[i]
-#     else:
-#         # If no weights provided, use uniform weights of 1.0
-#         for layer_idx in layers_to_control:
-#             layer_weight_map[layer_idx] = 1.0
-    
-#     for layer_idx in layers_to_control:
-#         control_vec = directions[layer_idx][component_idxs[0]]
-#         for component_idx in component_idxs[1:]:
-#             control_vec += directions[layer_idx][component_idx]
-#         if len(control_vec.shape)==1:
-#             control_vec = control_vec.reshape(1,1,-1)
-               
-#         block = model.model.decoder.layers[layer_idx]
-
-#         def block_hook(module, input, output, control_vec=control_vec, control_coef=control_coef, 
-#                       time_control_fn=time_control_fn, time_counters=time_step_counters, 
-#                       layer_idx=layer_idx, layer_weight=layer_weight_map[layer_idx]):
-#             """
-#             note that module, input are unused, but are
-#             required by torch.
-#             """ 
-            
-#             new_output = output[0]
-            
-#             # Calculate time-varying control coefficient
-#             if time_control_fn is not None:
-#                 # Get current time step and increment
-#                 current_time = time_counters[layer_idx]
-#                 time_counters[layer_idx] += 1
-                
-#                 # Apply time control function to get dynamic control coefficient
-#                 dynamic_control_coef = time_control_fn(current_time, control_coef)
-#                 #print(f"Layer {layer_idx}, Time step {current_time}: Dynamic control coefficient: {dynamic_control_coef}")
-#             else:
-#                 # Use static control coefficient
-#                 dynamic_control_coef = control_coef
-
-#             # Apply layer weight as a multiplier to the control coefficient
-#             weighted_control_coef = dynamic_control_coef * layer_weight
-            
-#             if inject_chance >= 1 or random.random() < inject_chance:
-#                 new_output = new_output + weighted_control_coef * control_vec.to(dtype=new_output.dtype, device=new_output.device)
-            
-#             if isinstance(output, tuple):
-#                 new_output = (new_output,) + output[1:] 
-            
-#             return new_output
-        
-#         hook_handle = block.register_forward_hook(block_hook)
-#         hooks[layer_idx] = hook_handle
-    
-#     return hooks
-
 def hook_model(model, directions, layers_to_control, control_coef, inject_chance=1, component_idxs=[0], time_control_fn=None, layer_weights=None):
     hooks = {}
     
@@ -92,9 +28,11 @@ def hook_model(model, directions, layers_to_control, control_coef, inject_chance
     
     # Determine if we need random checks
     use_random = inject_chance < 1
+
+    target_device = model.device
+    target_dtype = next(model.parameters()).dtype
     
     for layer_idx in layers_to_control:
-        # Use advanced indexing to sum components more efficiently
         if len(component_idxs) == 1:
             control_vec = directions[layer_idx][component_idxs[0]]
         else:
@@ -102,15 +40,9 @@ def hook_model(model, directions, layers_to_control, control_coef, inject_chance
         
         if len(control_vec.shape) == 1:
             control_vec = control_vec.reshape(1, 1, -1)
-        
-        # Get target device and dtype from model
-        target_device = model.device
-        target_dtype = next(model.parameters()).dtype
-        
-        # Pre-convert control vector to target device/dtype ONCE
+            
         control_vec = control_vec.to(dtype=target_dtype, device=target_device)
         
-        # Pre-compute static weighted control vector if no time control
         layer_weight = layer_weight_map[layer_idx]
         if time_control_fn is None:
             precomputed_vec = control_coef * layer_weight * control_vec
@@ -131,11 +63,9 @@ def hook_model(model, directions, layers_to_control, control_coef, inject_chance
             
             new_output = output[0]
             
-            # Skip if random check fails
             if use_random and random.random() >= inject_chance:
                 return output
             
-            # Calculate control vector to add
             if precomputed_vec is not None:
                 # Static case - use precomputed
                 control_to_add = precomputed_vec
@@ -196,46 +126,75 @@ def multidirection_hook_model(model, directions_list, layers_to_control, control
             weights = {layer_idx: 1.0 for layer_idx in all_layers}
             layer_weights.append(weights)
     
-    # Process each layer that appears in any concept
+    target_device = model.device
+    target_dtype = next(model.parameters()).dtype
+    
+    max_layer = max(all_layers)
+    
+    layer_direction_data = {}  # {layer_idx: [(dir_idx, control_vec, control_coef, time_fn, layer_weight, inject_chance, use_random, precomputed_vec), ...]}
+    
+    for layer_idx in all_layers:
+        direction_data = []
+        for dir_idx, directions in enumerate(directions_list):
+            if layer_idx in layers_to_control[dir_idx]:
+                control_vec = directions[layer_idx][component_idx]
+                if len(control_vec.shape) == 1:
+                    control_vec = control_vec.reshape(1, 1, -1)
+                
+                control_vec = control_vec.to(dtype=target_dtype, device=target_device)
+                
+                control_coef = control_coefs[dir_idx]
+                time_control_fn = time_control_fns[dir_idx]
+                layer_weight = layer_weights[dir_idx][layer_idx]
+                inject_chance = inject_chances[dir_idx]
+                use_random = inject_chance < 1.0
+                
+                if time_control_fn is None:
+                    precomputed_vec = control_coef * layer_weight * control_vec
+                else:
+                    precomputed_vec = None
+                
+                direction_data.append((dir_idx, control_vec, control_coef, time_control_fn, 
+                                      layer_weight, inject_chance, use_random, precomputed_vec))
+        
+        layer_direction_data[layer_idx] = direction_data
+    
     for layer_idx in all_layers:
         block = model.model.decoder.layers[layer_idx]
+        direction_data = layer_direction_data[layer_idx]
 
-        def block_hook(module, input, output, layer_idx=layer_idx):
+        def block_hook(module, input, output, layer_idx=layer_idx, direction_data=direction_data, 
+                      max_layer=max_layer):
             nonlocal global_time_counter
             
             combined_control_vec = None
             
-            for dir_idx, directions in enumerate(directions_list):
-                # Only process this direction if it has this layer
-                if layer_idx in layers_to_control[dir_idx]:
-                    control_vec = directions[layer_idx][component_idx]
-                    if len(control_vec.shape) == 1:
-                        control_vec = control_vec.reshape(1, 1, -1)
-                    
-                    control_coef = control_coefs[dir_idx]
-                    time_control_fn = time_control_fns[dir_idx]
-                    layer_weight = layer_weights[dir_idx][layer_idx]
-                    inject_chance = inject_chances[dir_idx]
-                    
-                    # Use the global time counter for time control
-                    dynamic_control_coef = time_control_fn(global_time_counter, control_coef) if time_control_fn is not None else control_coef
-                    
+            for dir_idx, control_vec, control_coef, time_control_fn, layer_weight, inject_chance, use_random, precomputed_vec in direction_data:
+                if use_random and random.random() >= inject_chance:
+                    continue
+                
+                if precomputed_vec is not None:
+                    # Static case - use precomputed
+                    control_to_add = precomputed_vec
+                else:
+                    # Dynamic case - compute time-varying coefficient
+                    dynamic_control_coef = time_control_fn(global_time_counter, control_coef)
                     weighted_control_coef = dynamic_control_coef * layer_weight
-                    
-                    # Only add this direction's control vector with probability inject_chance
-                    if inject_chance >= 1.0 or random.random() < inject_chance:
-                        if combined_control_vec is None:
-                            combined_control_vec = weighted_control_coef * control_vec
-                        else:
-                            combined_control_vec = combined_control_vec + weighted_control_coef * control_vec
+                    control_to_add = weighted_control_coef * control_vec
+                
+                # Accumulate control vectors
+                if combined_control_vec is None:
+                    combined_control_vec = control_to_add
+                else:
+                    combined_control_vec = combined_control_vec + control_to_add
             
             # Only increment time counter for the LAST layer (indicating completion of a generation step)
-            if layer_idx == max(all_layers):
+            if layer_idx == max_layer:
                 global_time_counter += 1
             
             if combined_control_vec is not None:
                 new_output = output[0]
-                new_output = new_output + combined_control_vec.to(dtype=new_output.dtype, device=new_output.device)
+                new_output = new_output + combined_control_vec
                 
                 if isinstance(output, tuple):
                     new_output = (new_output,) + output[1:] 
@@ -248,37 +207,6 @@ def multidirection_hook_model(model, directions_list, layers_to_control, control
         hooks[layer_idx] = hook_handle
     
     return hooks
-
-
-# def hook_model(model, directions, layers_to_control, control_coef, component_idx=0, time_control_fn=None):
-#     hooks = {}
-#     for layer_idx in layers_to_control:
-#         control_vec = directions[layer_idx][component_idx]
-#         if len(control_vec.shape)==1:
-#             control_vec = control_vec.reshape(1,1,-1)
-               
-               
-#         block = model.model.decoder.layers[layer_idx]
-
-#         def block_hook(module, input, output, control_vec=control_vec, control_coef=control_coef):
-#             """
-#             note that module, input are unused, but are
-#             required by torch.
-#             """ 
-            
-#             new_output = output[0]
-
-#             new_output = new_output + control_coef*control_vec.to(dtype=new_output.dtype, device=new_output.device)
-            
-#             if isinstance(output, tuple):
-#                 new_output = (new_output,) + output[1:] 
-            
-#             return new_output
-        
-#         hook_handle = block.register_forward_hook(block_hook)
-#         hooks[layer_idx] = hook_handle
-    
-#     return hooks
 
 
 def clear_hooks(hooks) -> None:
