@@ -16,34 +16,114 @@ def generate_on_text(model, tokenizer, input_text, **kwargs):
     generated_text = tokenizer.decode(outputs[0])
     return generated_text
 
+# def hook_model(model, directions, layers_to_control, control_coef, inject_chance=1, component_idxs=[0], time_control_fn=None, layer_weights=None):
+#     hooks = {}
+    
+#     # Create a time step counter for each layer
+#     time_step_counters = {layer_idx: 0 for layer_idx in layers_to_control}
+    
+#     # Create a mapping from layer_idx to its weight
+#     layer_weight_map = {}
+#     if layer_weights is not None:
+#         for i, layer_idx in enumerate(layers_to_control):
+#             layer_weight_map[layer_idx] = layer_weights[i]
+#     else:
+#         # If no weights provided, use uniform weights of 1.0
+#         for layer_idx in layers_to_control:
+#             layer_weight_map[layer_idx] = 1.0
+    
+#     for layer_idx in layers_to_control:
+#         control_vec = directions[layer_idx][component_idxs[0]]
+#         for component_idx in component_idxs[1:]:
+#             control_vec += directions[layer_idx][component_idx]
+#         if len(control_vec.shape)==1:
+#             control_vec = control_vec.reshape(1,1,-1)
+               
+#         block = model.model.decoder.layers[layer_idx]
+
+#         def block_hook(module, input, output, control_vec=control_vec, control_coef=control_coef, 
+#                       time_control_fn=time_control_fn, time_counters=time_step_counters, 
+#                       layer_idx=layer_idx, layer_weight=layer_weight_map[layer_idx]):
+#             """
+#             note that module, input are unused, but are
+#             required by torch.
+#             """ 
+            
+#             new_output = output[0]
+            
+#             # Calculate time-varying control coefficient
+#             if time_control_fn is not None:
+#                 # Get current time step and increment
+#                 current_time = time_counters[layer_idx]
+#                 time_counters[layer_idx] += 1
+                
+#                 # Apply time control function to get dynamic control coefficient
+#                 dynamic_control_coef = time_control_fn(current_time, control_coef)
+#                 #print(f"Layer {layer_idx}, Time step {current_time}: Dynamic control coefficient: {dynamic_control_coef}")
+#             else:
+#                 # Use static control coefficient
+#                 dynamic_control_coef = control_coef
+
+#             # Apply layer weight as a multiplier to the control coefficient
+#             weighted_control_coef = dynamic_control_coef * layer_weight
+            
+#             if inject_chance >= 1 or random.random() < inject_chance:
+#                 new_output = new_output + weighted_control_coef * control_vec.to(dtype=new_output.dtype, device=new_output.device)
+            
+#             if isinstance(output, tuple):
+#                 new_output = (new_output,) + output[1:] 
+            
+#             return new_output
+        
+#         hook_handle = block.register_forward_hook(block_hook)
+#         hooks[layer_idx] = hook_handle
+    
+#     return hooks
+
 def hook_model(model, directions, layers_to_control, control_coef, inject_chance=1, component_idxs=[0], time_control_fn=None, layer_weights=None):
     hooks = {}
     
     # Create a time step counter for each layer
     time_step_counters = {layer_idx: 0 for layer_idx in layers_to_control}
     
-    # Create a mapping from layer_idx to its weight
-    layer_weight_map = {}
-    if layer_weights is not None:
-        for i, layer_idx in enumerate(layers_to_control):
-            layer_weight_map[layer_idx] = layer_weights[i]
-    else:
-        # If no weights provided, use uniform weights of 1.0
-        for layer_idx in layers_to_control:
-            layer_weight_map[layer_idx] = 1.0
+    # Create layer weight map with dict comprehension
+    layer_weight_map = {layer_idx: layer_weights[i] if layer_weights is not None else 1.0 
+                        for i, layer_idx in enumerate(layers_to_control)}
+    
+    # Determine if we need random checks
+    use_random = inject_chance < 1
     
     for layer_idx in layers_to_control:
-        control_vec = directions[layer_idx][component_idxs[0]]
-        for component_idx in component_idxs[1:]:
-            control_vec += directions[layer_idx][component_idx]
-        if len(control_vec.shape)==1:
-            control_vec = control_vec.reshape(1,1,-1)
+        # Use advanced indexing to sum components more efficiently
+        if len(component_idxs) == 1:
+            control_vec = directions[layer_idx][component_idxs[0]]
+        else:
+            control_vec = torch.stack([directions[layer_idx][idx] for idx in component_idxs]).sum(dim=0)
+        
+        if len(control_vec.shape) == 1:
+            control_vec = control_vec.reshape(1, 1, -1)
+        
+        # Get target device and dtype from model
+        target_device = model.device
+        target_dtype = next(model.parameters()).dtype
+        
+        # Pre-convert control vector to target device/dtype ONCE
+        control_vec = control_vec.to(dtype=target_dtype, device=target_device)
+        
+        # Pre-compute static weighted control vector if no time control
+        layer_weight = layer_weight_map[layer_idx]
+        if time_control_fn is None:
+            precomputed_vec = control_coef * layer_weight * control_vec
+        else:
+            precomputed_vec = None
                
         block = model.model.decoder.layers[layer_idx]
 
         def block_hook(module, input, output, control_vec=control_vec, control_coef=control_coef, 
                       time_control_fn=time_control_fn, time_counters=time_step_counters, 
-                      layer_idx=layer_idx, layer_weight=layer_weight_map[layer_idx]):
+                      layer_idx=layer_idx, layer_weight=layer_weight, 
+                      use_random=use_random, inject_chance=inject_chance,
+                      precomputed_vec=precomputed_vec):
             """
             note that module, input are unused, but are
             required by torch.
@@ -51,25 +131,24 @@ def hook_model(model, directions, layers_to_control, control_coef, inject_chance
             
             new_output = output[0]
             
-            # Calculate time-varying control coefficient
-            if time_control_fn is not None:
-                # Get current time step and increment
+            # Skip if random check fails
+            if use_random and random.random() >= inject_chance:
+                return output
+            
+            # Calculate control vector to add
+            if precomputed_vec is not None:
+                # Static case - use precomputed
+                control_to_add = precomputed_vec
+            else:
+                # Dynamic case - compute time-varying coefficient
                 current_time = time_counters[layer_idx]
                 time_counters[layer_idx] += 1
                 
-                # Apply time control function to get dynamic control coefficient
                 dynamic_control_coef = time_control_fn(current_time, control_coef)
-                #print(f"Layer {layer_idx}, Time step {current_time}: Dynamic control coefficient: {dynamic_control_coef}")
-            else:
-                # Use static control coefficient
-                dynamic_control_coef = control_coef
-
-            # Apply layer weight as a multiplier to the control coefficient
-            weighted_control_coef = dynamic_control_coef * layer_weight
+                weighted_control_coef = dynamic_control_coef * layer_weight
+                control_to_add = weighted_control_coef * control_vec
             
-            # Only add the control vector with probability inject_chance
-            if inject_chance >= 1 or random.random() < inject_chance:
-                new_output = new_output + weighted_control_coef * control_vec.to(dtype=new_output.dtype, device=new_output.device)
+            new_output = new_output + control_to_add
             
             if isinstance(output, tuple):
                 new_output = (new_output,) + output[1:] 
